@@ -227,11 +227,10 @@ class TestHoldbackTextRecovery:
         """Multi-token batch where special token text is absent."""
         tok_a = 201
         tok_b = 202
-        tokenizer.decode.side_effect = lambda ids: {
-            tok_a: "alpha",
-            tok_b: "beta",
-            CHANNEL_END_ID: CHANNEL_END,
-        }.get(ids[0], "?")
+        token_text = {tok_a: "alpha", tok_b: "beta", CHANNEL_END_ID: CHANNEL_END}
+        tokenizer.decode.side_effect = lambda ids: "".join(
+            token_text.get(i, "?") for i in ids
+        )
 
         scanner_multi = TokenIDScanner(
             token_id_to_terminal={CHANNEL_END_ID: "THINK_END"},
@@ -1015,3 +1014,85 @@ class TestRebuildFromAnchorsCascadingDeferral:
         assert bare_scanner._deferred_post_text == "more"
         assert len(bare_scanner._deferred_terminals) == 1
         assert bare_scanner._deferred_terminals[0].terminal == "THINK_END"
+
+
+class TestSegmentedScan:
+    """A multi-token delta is cut at its special tokens before scanning."""
+
+    # Byte-level tokens: ids 300/301 are the two halves of "é", so each one
+    # decodes to a replacement character alone and to "é" together.
+    _TOKEN_BYTES = {
+        300: b"\xc3",
+        301: b"\xa9",
+        302: b"t",
+        303: TOOL_START.encode(),
+        TOOL_START_ID: TOOL_START.encode(),
+        TOOL_END_ID: TOOL_END.encode(),
+    }
+
+    @pytest.fixture
+    def byte_scanner(self):
+        tok = MagicMock()
+        tok.decode.side_effect = lambda ids: b"".join(
+            self._TOKEN_BYTES[i] for i in ids
+        ).decode("utf-8", errors="replace")
+        return TokenIDScanner(
+            token_id_to_terminal={
+                TOOL_START_ID: "TOOL_START",
+                TOOL_END_ID: "TOOL_END",
+            },
+            tokenizer=tok,
+        )
+
+    @staticmethod
+    def _shape(items):
+        return [
+            ("terminal", i.terminal)
+            if isinstance(i, PreLexedTerminal)
+            else ("text", i.text)
+            for i in items
+            if not (isinstance(i, TextChunk) and not i.text)
+        ]
+
+    def test_literal_lookalike_after_special_token_stays_after_it(self, byte_scanner):
+        # "é" (two byte tokens), the real <tool_call>, then the same string
+        # spelled with an ordinary token, then "t".
+        result = byte_scanner.scan(
+            delta_text=f"é{TOOL_START}{TOOL_START}t",
+            delta_token_ids=[300, 301, TOOL_START_ID, 303, 302],
+        )
+
+        assert self._shape(result) == [
+            ("text", "é"),
+            ("terminal", "TOOL_START"),
+            ("text", f"{TOOL_START}t"),
+        ]
+
+    def test_literal_lookalike_before_special_token_stays_text(self, byte_scanner):
+        result = byte_scanner.scan(
+            delta_text=f"{TOOL_START}é{TOOL_START}t",
+            delta_token_ids=[303, 300, 301, TOOL_START_ID, 302],
+        )
+
+        assert self._shape(result) == [
+            ("text", f"{TOOL_START}é"),
+            ("terminal", "TOOL_START"),
+            ("text", "t"),
+        ]
+
+    def test_held_back_text_stays_before_first_segment(self, byte_scanner):
+        result = byte_scanner.scan(
+            delta_text=f"held t{TOOL_START}t",
+            delta_token_ids=[302, TOOL_START_ID, 302],
+        )
+
+        assert self._shape(result) == [
+            ("text", "held t"),
+            ("terminal", "TOOL_START"),
+            ("text", "t"),
+        ]
+
+    def test_delta_without_special_tokens_is_not_cut(self, byte_scanner):
+        result = byte_scanner.scan(delta_text="ét", delta_token_ids=[300, 301, 302])
+
+        assert self._shape(result) == [("text", "ét")]

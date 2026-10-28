@@ -82,6 +82,74 @@ class TokenIDScanner:
         delta_text: str,
         delta_token_ids: Sequence[int],
     ) -> Sequence[LexerInput]:
+        """Split ``delta_text`` into pre-lexed terminals and text chunks.
+
+        A delta holding several tokens (batched streaming, speculative
+        decoding) is first cut at its special tokens, so that each one is
+        scanned together with exactly the text it decodes to. Otherwise a
+        special token would have to be located by searching for its text,
+        and a lookalike spelled out with ordinary tokens could be picked
+        instead.
+        """
+        segments = self._segment_delta(delta_text, delta_token_ids)
+        if segments is None:
+            return self._scan_segment(delta_text, delta_token_ids)
+        results: list[LexerInput] = []
+        for segment_text, segment_ids in segments:
+            results.extend(self._scan_segment(segment_text, segment_ids))
+        return results
+
+    def _segment_delta(
+        self,
+        delta_text: str,
+        delta_token_ids: Sequence[int],
+    ) -> list[tuple[str, Sequence[int]]] | None:
+        """Cut a multi-token delta at its special tokens.
+
+        Returns ``None`` when the delta needs no cutting or when its text
+        cannot be matched to its token ids (the detokenizer may hold back
+        or merge text), in which case the caller scans it whole.
+        """
+        if (
+            len(delta_token_ids) < 2
+            or self.tokenizer is None
+            or not self.token_id_to_terminal
+        ):
+            return None
+        cuts = [
+            i
+            for i, tid in enumerate(delta_token_ids)
+            if tid in self.token_id_to_terminal
+        ]
+        if not cuts:
+            return None
+        full = self._decode_all(delta_token_ids)
+        if full is None or not delta_text.endswith(full):
+            return None
+        # Text the detokenizer held back from earlier deltas comes first.
+        held_back = len(delta_text) - len(full)
+        bounds = sorted({0, len(delta_token_ids), *cuts, *(i + 1 for i in cuts)})
+        segments: list[tuple[str, Sequence[int]]] = []
+        start_char = 0
+        for start, end in zip(bounds, bounds[1:]):
+            end_char = len(self._decode_all(delta_token_ids[:end]) or "")
+            if start == 0:
+                text = delta_text[: held_back + end_char]
+            else:
+                text = full[start_char:end_char]
+            segments.append((text, delta_token_ids[start:end]))
+            start_char = end_char
+        return segments
+
+    def _decode_all(self, token_ids: Sequence[int]) -> str | None:
+        decoded = self.tokenizer.decode(list(token_ids))
+        return decoded if isinstance(decoded, str) else None
+
+    def _scan_segment(
+        self,
+        delta_text: str,
+        delta_token_ids: Sequence[int],
+    ) -> Sequence[LexerInput]:
         prefix_items: list[LexerInput] = []
         effective_text = delta_text
         deferred_trailing_count = 0

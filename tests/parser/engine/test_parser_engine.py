@@ -1112,6 +1112,130 @@ def test_parser_manager_preserves_tool_only_adapter(monkeypatch):
     assert tool_calls == []
 
 
+_TOOL_JSON = '{"name": "h", "arguments": {}}'
+
+
+def _char_ids(text: str) -> list[int]:
+    """Ids the mock tokenizer decodes back to ``text``, one per character."""
+    return [ord(c) for c in text]
+
+
+class TestSinglePassWithTokenIds:
+    """``DelegatingParser.parse`` honors ``model_output_token_ids``.
+
+    A tool tag the model wrote as ordinary text decodes to the same string as
+    the special token, so only the ids tell them apart. Parsing reasoning and
+    tools in two text-only steps turns that text into a tool call.
+    """
+
+    def _parse(self, text, ids, *, tool_choice="auto", parser_cls=_CombinedDelegating):
+        parser = parser_cls(make_mock_tokenizer(_VOCAB))
+        request = _make_delegating_request()
+        request.tool_choice = tool_choice
+        return parser.parse(
+            text, request, enable_auto_tools=True, model_output_token_ids=ids
+        )
+
+    def test_literal_tool_tag_in_content_is_not_a_tool_call(self):
+        literal = f"say <tool_call>{_TOOL_JSON}</tool_call>"
+        text = f"ab</think>{literal}"
+        ids = [*_char_ids("ab"), 201, *_char_ids(literal)]
+
+        reasoning, content, tool_calls = self._parse(text, ids)
+
+        assert reasoning == "ab"
+        assert content == literal
+        assert not tool_calls
+
+    def test_special_token_tool_tag_is_a_tool_call(self):
+        text = f"ab</think>say <tool_call>{_TOOL_JSON}</tool_call>"
+        ids = [
+            *_char_ids("ab"),
+            201,
+            *_char_ids("say "),
+            202,
+            *_char_ids(_TOOL_JSON),
+            203,
+        ]
+
+        reasoning, content, tool_calls = self._parse(text, ids)
+
+        assert reasoning == "ab"
+        assert content == "say"
+        assert tool_calls is not None
+        assert [tc.name for tc in tool_calls] == ["h"]
+
+    def test_literal_end_of_reasoning_tag_stays_reasoning(self):
+        """A literal ``</think>`` inside reasoning does not end it."""
+        text = "a</think>b</think>c"
+        ids = [*_char_ids("a</think>b"), 201, *_char_ids("c")]
+
+        reasoning, content, _ = self._parse(text, ids)
+
+        assert reasoning == "a</think>b"
+        assert content == "c"
+
+    def test_trailing_stop_token_id_not_in_text(self):
+        """The ids of a finished request end with the stop token, the text does not."""
+        literal = f"say <tool_call>{_TOOL_JSON}</tool_call> and </think> done"
+        text = f"ab</think>{literal}"
+        stop_id = 999  # decodes to "<999>", which the output text does not contain
+        ids = [*_char_ids("ab"), 201, *_char_ids(literal), stop_id]
+
+        reasoning, content, tool_calls = self._parse(text, ids)
+
+        assert reasoning == "ab"
+        assert content == literal
+        assert not tool_calls
+
+    def test_tool_choice_none_returns_no_tool_calls(self):
+        text = f"ab</think><tool_call>{_TOOL_JSON}</tool_call>"
+        ids = [*_char_ids("ab"), 201, 202, *_char_ids(_TOOL_JSON), 203]
+
+        _, _, tool_calls = self._parse(text, ids, tool_choice="none")
+
+        assert not tool_calls
+
+    def test_tool_only_parser_with_ids(self):
+        parser_cls = type(
+            "_ToolOnly",
+            (DelegatingParser,),
+            {"reasoning_parser_cls": None, "tool_parser_cls": _CombinedToolAdapter},
+        )
+        literal = f"<tool_call>{_TOOL_JSON}</tool_call>"
+
+        _, literal_content, literal_calls = self._parse(
+            literal, _char_ids(literal), parser_cls=parser_cls
+        )
+        _, _, real_calls = self._parse(
+            literal,
+            [202, *_char_ids(_TOOL_JSON), 203],
+            parser_cls=parser_cls,
+        )
+
+        assert literal_content == literal
+        assert not literal_calls
+        assert real_calls is not None
+        assert [tc.name for tc in real_calls] == ["h"]
+
+    def test_without_ids_falls_back_to_text_matching(self):
+        text = f"ab</think><tool_call>{_TOOL_JSON}</tool_call>"
+
+        _, _, tool_calls = self._parse(text, None)
+
+        assert tool_calls is not None
+        assert [tc.name for tc in tool_calls] == ["h"]
+
+    def test_ids_that_do_not_cover_the_text_fall_back(self):
+        """Ids for only a prefix must not drop the rest of the text."""
+        text = f"ab</think>tail <tool_call>{_TOOL_JSON}</tool_call>"
+
+        _, content, _ = self._parse(text, [*_char_ids("ab"), 201])
+
+        assert content is not None
+        assert content.startswith("tail")
+
+
 def test_reasoning_adapter_counts_after_final_non_streaming_parse():
     parser = _CombinedReasoningAdapter(make_mock_tokenizer(_VOCAB))
     request = _make_delegating_request()

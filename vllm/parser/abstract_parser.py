@@ -34,7 +34,10 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
-from vllm.parser.engine.adapters import ParserEngineToolAdapter
+from vllm.parser.engine.adapters import (
+    ParserEngineReasoningAdapter,
+    ParserEngineToolAdapter,
+)
 from vllm.parser.metrics import record_tool_parser_invocation
 from vllm.parser.utils import count_history_tool_calls
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
@@ -846,12 +849,170 @@ class DelegatingParser(Parser):
         model_output_token_ids: Sequence[int] = (),
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
         self._initialize_history_tool_call_cnt(request)
+        one_pass = self._parse_in_one_pass(
+            model_output, request, enable_auto_tools, model_output_token_ids
+        )
+        if one_pass is not None:
+            return one_pass
         reasoning, content = self.extract_reasoning(model_output, request)
         tool_calls, content = self._extract_tool_calls(
             content=content,
             request=request,
             enable_auto_tools=enable_auto_tools,
         )
+        return reasoning, content, tool_calls
+
+    def _uses_engine_tool_parsing(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        enable_auto_tools: bool,
+    ) -> bool:
+        """Whether `_extract_tool_calls` would hand the content to the tool
+        parser, as opposed to the JSON handling of a named or required
+        ``tool_choice``, or no tool calls at all."""
+        tool_parser = self._tool_parser
+        if tool_parser is None:
+            return False
+        tool_choice = request.tool_choice
+        if tool_choice == "none":
+            return True
+        is_named = bool(tool_choice) and isinstance(
+            tool_choice,
+            (ToolChoiceFunction, ToolChoiceCustom, ChatCompletionNamedToolChoiceParam),
+        )
+        is_required = tool_choice == "required"
+        return enable_auto_tools and (
+            tool_choice == "auto"
+            or tool_choice is None
+            or (
+                not tool_parser.supports_required_and_named
+                and (is_named or is_required)
+            )
+        )
+
+    def _drop_uncovered_trailing_ids(
+        self, model_output: str, model_output_token_ids: Sequence[int]
+    ) -> Sequence[int]:
+        """Drop trailing stop-token ids that the output text does not end with.
+
+        The ids of a finished request include the stop token (for example the
+        end-of-turn token), but its text is not part of the output. Left in,
+        the ids decode to more than the text, the engine cannot line the two
+        up, and it falls back to finding markers by their text alone, which
+        cannot tell a special token from the same characters written with
+        ordinary tokens.
+        """
+        ids = list(model_output_token_ids)
+        for _ in range(2):
+            if not ids:
+                break
+            try:
+                last = self.model_tokenizer.decode([ids[-1]])
+            except Exception:
+                break
+            if isinstance(last, str) and last and model_output.endswith(last):
+                break
+            ids.pop()
+        return ids
+
+    def _ids_cover_text(
+        self, model_output: str, model_output_token_ids: Sequence[int]
+    ) -> bool:
+        """Whether the token ids decode to all of `model_output`.
+
+        The text is shorter than the decoded ids when a stop string or the
+        stop token ends it. It is never longer when the ids are the ones it
+        was decoded from. If it is, the ids belong to something else or are
+        incomplete, and the engine would drop the text they don't cover, so
+        the caller must not feed them.
+        """
+        try:
+            decoded = self.model_tokenizer.decode(list(model_output_token_ids))
+        except Exception:
+            return False
+        return isinstance(decoded, str) and len(decoded) >= len(model_output)
+
+    def _parse_in_one_pass(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+        enable_auto_tools: bool,
+        model_output_token_ids: Sequence[int],
+    ) -> tuple[str | None, str | None, list[FunctionCall] | None] | None:
+        """Parse reasoning and tool calls in one engine pass over the text and
+        its token ids.
+
+        The two-step path (`extract_reasoning`, then `_extract_tool_calls`)
+        feeds the engine text only, so it has to find every marker by its
+        text and cannot tell a special token from the same characters
+        written with ordinary tokens. A model that quotes a tool call, or
+        ``</think>``, would then have it parsed as structure. A single pass
+        keeps the text aligned with the ids, as streaming does.
+
+        Returns None when the configured parsers need the two-step path:
+        without token ids, with parsers that are not engine adapters of the
+        same engine, or with a ``tool_choice`` that is handled as JSON.
+        """
+        if not model_output_token_ids:
+            return None
+        reasoning_parser = self._reasoning_parser
+        tool_parser = self._tool_parser
+        if reasoning_parser is None and tool_parser is None:
+            return None
+        if reasoning_parser is not None and not isinstance(
+            reasoning_parser, ParserEngineReasoningAdapter
+        ):
+            return None
+        if tool_parser is not None and not isinstance(
+            tool_parser, ParserEngineToolAdapter
+        ):
+            return None
+        if (
+            reasoning_parser is not None
+            and tool_parser is not None
+            and reasoning_parser._parser_engine_cls
+            is not tool_parser._parser_engine_cls
+        ):
+            # TODO: support mixed engines. The reasoning step returns content
+            # that no longer lines up with the token ids.
+            return None
+        parse_tools = self._uses_engine_tool_parsing(request, enable_auto_tools)
+        if tool_parser is not None and not parse_tools:
+            return None
+        model_output_token_ids = self._drop_uncovered_trailing_ids(
+            model_output, model_output_token_ids
+        )
+        if not self._ids_cover_text(model_output, model_output_token_ids):
+            return None
+
+        # The reasoning engine holds the state set from the prompt, so it is
+        # the one to use whenever there is a reasoning parser.
+        engine_parser = (
+            reasoning_parser if reasoning_parser is not None else tool_parser
+        )
+        assert engine_parser is not None
+        is_tool_called: bool | Exception = False
+        try:
+            reasoning, content, tool_calls = engine_parser.parse_model_output(
+                model_output,
+                request,
+                model_output_token_ids,
+                parse_reasoning=reasoning_parser is not None,
+                parse_tools=parse_tools,
+            )
+            is_tool_called = bool(tool_calls)
+        except Exception as e:
+            is_tool_called = e
+            raise
+        finally:
+            if tool_parser is not None:
+                record_tool_parser_invocation(
+                    is_tool_called=is_tool_called,
+                    is_streaming=False,
+                    request=request,
+                )
+        if tool_parser is not None and request.tool_choice == "none":
+            tool_calls = []
         return reasoning, content, tool_calls
 
     def parse_delta(

@@ -836,12 +836,23 @@ class ParserEngine(Parser):
         request: ChatCompletionRequest | ResponsesRequest,
         enable_auto_tools: bool = False,
         model_output_token_ids: Sequence[int] = (),
+        *,
+        initial_state: ParserState | None = None,
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
+        """Parse a complete output in one pass.
+
+        ``model_output_token_ids`` must be the ids that ``model_output`` was
+        decoded from, so that a marker the model spelled out with ordinary
+        tokens can be told from the marker's special token. ``initial_state``
+        overrides the state to start in, e.g. ``CONTENT`` for output whose
+        reasoning has been removed.
+        """
         self._initialize_history_tool_call_cnt(request)
         self._check_skip_tool_parsing(request)
         reasoning, content, tool_call_info = self._single_pass_parse(
             model_output,
             model_output_token_ids,
+            initial_state=initial_state,
         )
 
         tool_calls: list[FunctionCall] | None = None

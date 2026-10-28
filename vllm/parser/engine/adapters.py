@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from vllm.entrypoints.generate.base.protocol import (
         DeltaMessage,
         ExtractedToolCallInformation,
+        FunctionCall,
     )
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
@@ -32,7 +33,57 @@ if TYPE_CHECKING:
     from vllm.tool_parsers.utils import Tool
 
 
-class ParserEngineReasoningAdapter(ReasoningParser):
+class _ParserEngineAdapterMixin:
+    """One-pass, token-id-aware parsing shared by both adapters."""
+
+    _parser_engine: ParserEngine
+
+    def parse_model_output(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+        model_output_token_ids: Sequence[int],
+        *,
+        parse_reasoning: bool,
+        parse_tools: bool,
+    ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
+        """Parse reasoning and tool calls from a complete output in one pass.
+
+        The output is fed to the engine together with its token ids, so a
+        marker that the model spelled out with ordinary tokens stays content,
+        as it does when the same output is streamed.
+
+        Args:
+            model_output: The complete decoded output.
+            request: The request the output answers.
+            model_output_token_ids: Ids the output was decoded from.
+            parse_reasoning: Start in the engine's initial state. Otherwise
+                start in ``CONTENT``, as for output whose reasoning has
+                already been removed.
+            parse_tools: Return tool calls. Otherwise the engine treats tool
+                markup as content.
+
+        """
+        engine = self._parser_engine
+        saved_skip_tool_parsing = engine.skip_tool_parsing
+        engine.skip_tool_parsing = saved_skip_tool_parsing or not parse_tools
+        try:
+            reasoning, content, tool_calls = engine.parse(
+                model_output,
+                request,
+                model_output_token_ids=model_output_token_ids,
+                initial_state=None if parse_reasoning else ParserState.CONTENT,
+            )
+        finally:
+            engine.skip_tool_parsing = saved_skip_tool_parsing
+        return (
+            reasoning if parse_reasoning else None,
+            content,
+            tool_calls if parse_tools else None,
+        )
+
+
+class ParserEngineReasoningAdapter(_ParserEngineAdapterMixin, ReasoningParser):
     """Adapts a :class:`ParserEngine` to the :class:`ReasoningParser`
     interface so parser engines can be used as reasoning parsers in the
     existing serving code.
@@ -162,7 +213,7 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         return self._counting_parser_engine.count_reasoning_tokens(token_ids)
 
 
-class ParserEngineToolAdapter(ToolParser):
+class ParserEngineToolAdapter(_ParserEngineAdapterMixin, ToolParser):
     """Adapts a :class:`ParserEngine` to the :class:`ToolParser` interface.
 
     :meth:`extract_tool_calls` starts the parser engine in ``CONTENT``
